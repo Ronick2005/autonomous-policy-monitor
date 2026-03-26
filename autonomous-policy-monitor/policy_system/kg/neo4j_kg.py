@@ -245,17 +245,32 @@ class Neo4jPolicyGraph:
                  conflict_description=conflict_description, severity=severity)
             return True
     
-    def find_policy_conflicts(self, organization: str) -> List[Dict]:
-        """Find all policy conflicts in an organization"""
+    def find_policy_conflicts(self, organization: Optional[str] = None,
+                              limit: int = 50) -> List[Dict]:
+        """Find policy conflicts, optionally filtered by organization"""
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (o:Organization {name: $organization})-[:HAS_POLICY]->(p1:Policy)
-                MATCH (p1)-[c:CONFLICTS_WITH]->(p2:Policy)
-                RETURN p1.id AS policy1_id, p1.title AS policy1_title,
-                       p2.id AS policy2_id, p2.title AS policy2_title,
-                       c.description AS conflict_description,
-                       c.severity AS severity
-            """, organization=organization)
+            if organization:
+                result = session.run("""
+                    MATCH (o:Organization {name: $organization})-[:HAS_POLICY]->(p1:Policy)
+                    MATCH (p1)-[c:CONFLICTS_WITH]->(p2:Policy)
+                    RETURN p1.id AS policy1_id, p1.title AS policy1_title,
+                           p2.id AS policy2_id, p2.title AS policy2_title,
+                           c.description AS conflict_description,
+                           c.severity AS severity,
+                           o.name AS organization
+                    LIMIT $limit
+                """, organization=organization, limit=limit)
+            else:
+                result = session.run("""
+                    MATCH (p1:Policy)-[c:CONFLICTS_WITH]->(p2:Policy)
+                    OPTIONAL MATCH (o:Organization)-[:HAS_POLICY]->(p1)
+                    RETURN p1.id AS policy1_id, p1.title AS policy1_title,
+                           p2.id AS policy2_id, p2.title AS policy2_title,
+                           c.description AS conflict_description,
+                           c.severity AS severity,
+                           o.name AS organization
+                    LIMIT $limit
+                """, limit=limit)
             return [dict(record) for record in result]
     
     def get_policy_dependencies(self, policy_id: str) -> List[Dict]:
@@ -394,16 +409,42 @@ class Neo4jPolicyGraph:
         """Get overall knowledge graph statistics"""
         with self.driver.session() as session:
             result = session.run("""
-                MATCH (o:Organization)
-                OPTIONAL MATCH (p:Policy)
-                OPTIONAL MATCH (r:Regulation)
-                OPTIONAL MATCH (d:Department)
-                OPTIONAL MATCH (v:Violation)
-                RETURN count(DISTINCT o) as organizations,
-                       count(DISTINCT p) as policies,
-                       count(DISTINCT r) as regulations,
-                       count(DISTINCT d) as departments,
-                       count(DISTINCT v) as violations
+                CALL {
+                    MATCH (o:Organization)
+                    RETURN count(o) AS organizations
+                }
+                CALL {
+                    MATCH (p:Policy)
+                    RETURN count(p) AS policies
+                }
+                CALL {
+                    MATCH (r:Regulation)
+                    RETURN count(r) AS regulations
+                }
+                CALL {
+                    MATCH (d:Department)
+                    RETURN count(d) AS departments
+                }
+                CALL {
+                    MATCH (v:Violation)
+                    RETURN count(v) AS violations
+                }
+                CALL {
+                    MATCH (:Policy)-[c:CONFLICTS_WITH]->(:Policy)
+                    RETURN count(c) AS conflicts
+                }
+                RETURN organizations,
+                       policies,
+                       regulations,
+                       departments,
+                       violations,
+                       conflicts,
+                       organizations AS total_organizations,
+                       policies AS total_policies,
+                       regulations AS total_regulations,
+                       departments AS total_departments,
+                       violations AS total_violations,
+                       conflicts AS total_conflicts
             """)
             return dict(result.single())
     
@@ -421,17 +462,36 @@ class Neo4jPolicyGraph:
             """, organization=organization, category=regulation_category)
             return [dict(record) for record in result]
     
-    def get_high_risk_policies(self, organization: str) -> List[Dict]:
-        """Get all high-risk policies for an organization"""
+    def get_high_risk_policies(self, organization: Optional[str] = None,
+                               limit: int = 10) -> List[Dict]:
+        """Get high-risk policies, optionally filtered by organization"""
         with self.driver.session() as session:
-            result = session.run("""
-                MATCH (o:Organization {name: $organization})-[:HAS_POLICY]->(p:Policy)
-                WHERE p.risk_level = 'high' AND p.status = 'active'
-                OPTIONAL MATCH (p)-[:HAS_VIOLATION]->(v:Violation)
-                WHERE v.resolved = false
-                RETURN p.id AS policy_id, p.title AS title,
-                       p.category AS category, p.risk_level AS risk_level,
-                       count(v) AS open_violations
-                ORDER BY open_violations DESC, p.effective_date DESC
-            """, organization=organization)
+            if organization:
+                result = session.run("""
+                    MATCH (o:Organization {name: $organization})-[:HAS_POLICY]->(p:Policy)
+                    WHERE p.risk_level IN ['high', 'critical'] AND p.status = 'active'
+                    OPTIONAL MATCH (p)-[:HAS_VIOLATION]->(v:Violation)
+                    WHERE v.resolved = false
+                    RETURN p.id AS policy_id, p.title AS title,
+                           p.category AS category, p.risk_level AS risk_level,
+                           p.effective_date AS effective_date,
+                           count(v) AS open_violations,
+                           o.name AS organization
+                    ORDER BY open_violations DESC, effective_date DESC
+                    LIMIT $limit
+                """, organization=organization, limit=limit)
+            else:
+                result = session.run("""
+                    MATCH (o:Organization)-[:HAS_POLICY]->(p:Policy)
+                    WHERE p.risk_level IN ['high', 'critical'] AND p.status = 'active'
+                    OPTIONAL MATCH (p)-[:HAS_VIOLATION]->(v:Violation)
+                    WHERE v.resolved = false
+                    RETURN p.id AS policy_id, p.title AS title,
+                           p.category AS category, p.risk_level AS risk_level,
+                           p.effective_date AS effective_date,
+                           count(v) AS open_violations,
+                           o.name AS organization
+                    ORDER BY open_violations DESC, effective_date DESC
+                    LIMIT $limit
+                """, limit=limit)
             return [dict(record) for record in result]

@@ -48,15 +48,19 @@ class MongoPolicyKB:
         
         # Try to initialize vector search (requires Atlas with vector search index)
         self.vector_store = None
-        try:
-            self.vector_store = MongoDBAtlasVectorSearch(
-                collection=self.collection,
-                embedding=self.embeddings,
-                index_name="vector_index"
-            )
-        except Exception as e:
-            print(f"[WARNING] Vector search not initialized: {e}")
-            print("  Using basic MongoDB search instead.")
+        if self.embeddings and MONGODB_URI.startswith("mongodb+srv://"):
+            try:
+                self.vector_store = MongoDBAtlasVectorSearch(
+                    collection=self.collection,
+                    embedding=self.embeddings,
+                    index_name="vector_index"
+                )
+                print("[OK] MongoDB Atlas vector search client initialized")
+            except Exception as e:
+                print(f"[WARNING] Vector search not initialized: {e}")
+                print("  Falling back to local embedding/text search.")
+        else:
+            print("[INFO] Atlas vector index unavailable; using local embedding/text search.")
     
     def add_document(self, content: str, metadata: Dict, doc_id: str = None) -> bool:
         """Add a document to the knowledge base"""
@@ -103,31 +107,135 @@ class MongoPolicyKB:
                     k=k,
                     pre_filter=filter
                 )
-                return results
+                if results:
+                    return results
             except Exception as e:
                 print(f"Vector search failed: {e}. Falling back to text search.")
+
+        # Fallback to local embedding similarity when Atlas vector search is unavailable
+        if self.embeddings:
+            embedding_results = self._embedding_search(query, k, filter)
+            if embedding_results:
+                return embedding_results
         
         # Fallback to text search
         return self._text_search(query, k, filter)
+
+    @staticmethod
+    def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+        """Compute cosine similarity between two embedding vectors."""
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return -1.0
+
+        dot_product = sum(a * b for a, b in zip(vec_a, vec_b))
+        norm_a = sum(a * a for a in vec_a) ** 0.5
+        norm_b = sum(b * b for b in vec_b) ** 0.5
+
+        if norm_a == 0 or norm_b == 0:
+            return -1.0
+
+        return dot_product / (norm_a * norm_b)
+
+    def _embedding_search(self, query: str, k: int = 5,
+                         filter: Dict = None) -> List[Document]:
+        """Local embedding similarity search over stored document embeddings."""
+        try:
+            query_embedding = self.embeddings.embed_query(query)
+        except Exception as e:
+            print(f"Embedding generation failed: {e}. Falling back to text search.")
+            return []
+
+        mongo_filter = {"embedding": {"$exists": True}}
+        if filter:
+            mongo_filter.update(filter)
+
+        # Scan a bounded set for relevance ranking in local/non-Atlas environments
+        candidates = self.collection.find(mongo_filter).limit(1000)
+        scored_docs = []
+
+        for item in candidates:
+            embedding = item.get("embedding")
+            if not embedding:
+                continue
+
+            score = self._cosine_similarity(query_embedding, embedding)
+            if score < 0:
+                continue
+
+            scored_docs.append((score, item))
+
+        if not scored_docs:
+            return []
+
+        scored_docs.sort(key=lambda x: x[0], reverse=True)
+        top_items = scored_docs[:k]
+
+        documents = []
+        for _, result in top_items:
+            documents.append(Document(
+                page_content=result.get("content", ""),
+                metadata=result.get("metadata", {})
+            ))
+
+        return documents
     
     def _text_search(self, query: str, k: int = 5, 
                     filter: Dict = None) -> List[Document]:
         """Fallback text-based search"""
+        documents = []
+
+        # 1) Try MongoDB text index search first
         query_filter = {"$text": {"$search": query}}
-        
         if filter:
             query_filter.update(filter)
-        
-        results = self.collection.find(query_filter).limit(k)
-        
-        documents = []
+
+        try:
+            results = self.collection.find(query_filter).limit(k)
+            for result in results:
+                documents.append(Document(
+                    page_content=result.get("content", ""),
+                    metadata=result.get("metadata", {})
+                ))
+
+            if documents:
+                return documents
+        except Exception:
+            pass
+
+        # 2) Fallback: token-based regex search on content/metadata fields
+        tokens = [token for token in query.split() if len(token) > 2][:8]
+        if tokens:
+            regex_conditions = [
+                {"content": {"$regex": token, "$options": "i"}} for token in tokens
+            ] + [
+                {"metadata.title": {"$regex": token, "$options": "i"}} for token in tokens
+            ] + [
+                {"metadata.name": {"$regex": token, "$options": "i"}} for token in tokens
+            ]
+
+            regex_filter = {"$or": regex_conditions}
+            if filter:
+                regex_filter.update(filter)
+
+            results = self.collection.find(regex_filter).limit(k)
+            for result in results:
+                documents.append(Document(
+                    page_content=result.get("content", ""),
+                    metadata=result.get("metadata", {})
+                ))
+
+            if documents:
+                return documents
+
+        # 3) Final fallback: return latest documents so responses remain KB-grounded
+        latest_filter = filter or {}
+        results = self.collection.find(latest_filter).sort("_id", -1).limit(k)
         for result in results:
-            doc = Document(
+            documents.append(Document(
                 page_content=result.get("content", ""),
                 metadata=result.get("metadata", {})
-            )
-            documents.append(doc)
-        
+            ))
+
         return documents
     
     def hybrid_search(self, query: str, k: int = 5, 

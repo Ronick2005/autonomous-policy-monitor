@@ -204,11 +204,21 @@ class PolicyMonitoringOrchestrator:
         except Exception as e:
             kb_context = f"Error retrieving knowledge base context: {str(e)}"
         
+        # Context quality flags (used to prevent ungrounded responses)
+        has_kb_evidence = kb_context.startswith("Relevant Documents from Knowledge Base")
+        has_kg_evidence = (
+            "High-Risk Policies:" in kg_context or
+            "Known Policy Conflicts:" in kg_context
+        )
+
         # Update state
         state["kg_context"] = kg_context
         state["kb_context"] = kb_context
         state["metadata"]["kg_context_length"] = len(kg_context)
         state["metadata"]["kb_context_length"] = len(kb_context)
+        state["metadata"]["has_kb_evidence"] = has_kb_evidence
+        state["metadata"]["has_kg_evidence"] = has_kg_evidence
+        state["metadata"]["is_grounded"] = has_kb_evidence or has_kg_evidence
         
         return state
     
@@ -232,6 +242,21 @@ class PolicyMonitoringOrchestrator:
         }
         
         agent = agent_map.get(agent_route, self.basic_query_agent)
+
+        # Guardrail: do not generate answers without KB/KG evidence
+        if not state.get("metadata", {}).get("is_grounded", False):
+            result = {
+                "agent": "grounding_guard",
+                "response": (
+                    "I couldn't find enough supporting evidence in the Knowledge Base or "
+                    "Knowledge Graph to answer reliably. Please repopulate KB/KG or refine "
+                    "the query with organization/policy identifiers."
+                )
+            }
+            state["intermediate_results"] = [result]
+            state["metadata"]["agent_execution_status"] = "skipped_no_evidence"
+            state["metadata"]["agent_used"] = "grounding_guard"
+            return state
         
         # Execute agent
         try:
@@ -265,8 +290,9 @@ class PolicyMonitoringOrchestrator:
             # Add metadata footer for research traceability
             footer = f"\n\n---\n**Agent Used:** {result.get('agent', 'Unknown')}\n"
             footer += f"**Intent Detected:** {state['intent']}\n"
-            footer += f"**KG Context:** {'Yes' if state['kg_context'] and 'Error' not in state['kg_context'] else 'No'}\n"
-            footer += f"**KB Context:** {'Yes' if state['kb_context'] and 'Error' not in state['kb_context'] else 'No'}\n"
+            footer += f"**KG Context:** {'Yes' if state.get('metadata', {}).get('has_kg_evidence', False) else 'No'}\n"
+            footer += f"**KB Context:** {'Yes' if state.get('metadata', {}).get('has_kb_evidence', False) else 'No'}\n"
+            footer += f"**Grounded Response:** {'Yes' if state.get('metadata', {}).get('is_grounded', False) else 'No'}\n"
             
             final_response = response + footer
         else:
